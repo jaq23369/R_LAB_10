@@ -230,7 +230,6 @@ cat("Dimensiones tras limpieza:", nrow(df_clean), "filas x",
 cat("Distribución de clases tras limpieza:\n")
 print(table(df_clean$y))
 ```
-
 La limpieza de datos se enfocó en dos problemas identificados durante el 
 análisis exploratorio. Primero, se eliminaron los 3 registros cuya duración 
 de llamada era igual a cero, ya que estos representan contactos que nunca 
@@ -247,3 +246,35 @@ la limpieza el dataset quedó con 45,208 filas y 18 columnas, manteniendo la
 distribución original de clases prácticamente intacta con 39,919 registros 
 negativos y 5,289 positivos, lo que confirma que las transformaciones 
 aplicadas no alteraron la representatividad del conjunto de datos.
+
+# Preprocesamiento de Datos
+```{r preprocesamiento}
+# One-hot encoding de variables categóricas
+dummies <- dummyVars(y ~ ., data = df_clean)
+X <- predict(dummies, newdata = df_clean)
+y_label <- df_clean$y
+
+# Normalización min-max [0,1]
+preproc <- preProcess(X, method = "range")
+X_scaled <- predict(preproc, X)
+X_scaled <- as.data.frame(X_scaled)
+
+cat("Dimensiones tras preprocesamiento:", nrow(X_scaled), "filas x", 
+    ncol(X_scaled), "columnas\n")
+cat("Variables generadas por encoding:", ncol(X_scaled), "\n")
+```
+
+Una vez limpio el dataset, se aplicaron dos transformaciones para dejarlo 
+listo para el modelado. Primero, se realizó one-hot encoding sobre todas 
+las variables categóricas mediante dummyVars, que convierte cada nivel de 
+cada variable en una columna binaria independiente. Como resultado, el 
+dataset pasó de 18 columnas originales a 52 columnas, reflejando la 
+expansión generada por las variables con múltiples niveles como job con 
+12 categorías, month con 12 meses y poutcome con 4 niveles. Este paso 
+es necesario porque los algoritmos de aprendizaje semi-supervisado no 
+pueden operar directamente sobre texto o factores. Segundo, se normalizaron 
+todas las variables numéricas al rango [0,1] mediante min-max scaling, 
+lo cual es especialmente crítico para Label Spreading, cuyo funcionamiento 
+interno construye una matriz de afinidad basada en distancias euclidianas 
+entre puntos: si las variables tuvieran escalas muy distintas, como ocurría 
+con balance que llegaba hasta 102,127 euros frente a
