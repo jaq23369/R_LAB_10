@@ -277,4 +277,74 @@ todas las variables numéricas al rango [0,1] mediante min-max scaling,
 lo cual es especialmente crítico para Label Spreading, cuyo funcionamiento 
 interno construye una matriz de afinidad basada en distancias euclidianas 
 entre puntos: si las variables tuvieran escalas muy distintas, como ocurría 
-con balance que llegaba hasta 102,127 euros frente a
+con balance que llegaba hasta 102,127 euros frente a variables binarias 
+en escala [0,1], las de mayor magnitud dominarían el cálculo de distancias 
+y distorsionarían completamente los resultados del algoritmo.
+
+# Diseño Experimental
+```{r diseno-experimental}
+set.seed(42)
+
+# Submuestreo estratificado por limitaciones computacionales de Label Spreading
+idx_sub <- createDataPartition(y_label, p = 8000/length(y_label), list = FALSE)
+X_sub <- X_scaled[idx_sub, ]
+y_sub <- y_label[idx_sub]
+
+cat("Tamaño del subconjunto:", nrow(X_sub), "filas\n")
+cat("Distribución de clases en subconjunto:\n")
+print(table(y_sub))
+
+# Split 80% entrenamiento / 20% prueba (estratificado)
+idx_train <- createDataPartition(y_sub, p = 0.8, list = FALSE)
+X_train <- X_sub[idx_train, ]
+X_test  <- X_sub[-idx_train, ]
+y_train <- y_sub[idx_train]
+y_test  <- y_sub[-idx_train]
+
+cat("\nTamaño entrenamiento:", nrow(X_train), "\n")
+cat("Tamaño prueba:", nrow(X_test), "\n")
+
+# Función para crear split semisupervisado dado un porcentaje de etiquetados
+crear_split_semisupervisado <- function(X, y, pct_labeled, seed = 42) {
+  set.seed(seed)
+  idx_labeled <- createDataPartition(y, p = pct_labeled, list = FALSE)
+  
+  list(
+    X_labeled   = X[idx_labeled, ],
+    y_labeled   = y[idx_labeled],
+    X_unlabeled = X[-idx_labeled, ],
+    y_unlabeled = y[-idx_labeled]  # solo para evaluación posterior
+  )
+}
+
+# Generar splits para 5%, 10% y 20% de datos etiquetados
+pcts <- c(0.05, 0.10, 0.20)
+splits <- lapply(pcts, function(p) crear_split_semisupervisado(X_train, y_train, p))
+names(splits) <- c("5%", "10%", "20%")
+
+# Verificar tamaños
+for (pct in names(splits)) {
+  cat("\n--- Porcentaje etiquetado:", pct, "---\n")
+  cat("Datos etiquetados:", nrow(splits[[pct]]$X_labeled), "\n")
+  cat("Datos no etiquetados:", nrow(splits[[pct]]$X_unlabeled), "\n")
+  cat("Distribución etiquetados:\n")
+  print(table(splits[[pct]]$y_labeled))
+}
+```
+El diseño experimental quedó estructurado de la siguiente manera. Del total 
+de 45,208 observaciones preprocesadas se extrajo un subconjunto estratificado 
+de 8,001 filas, preservando la proporción original de clases con 7,065 
+registros negativos y 936 positivos. Este subconjunto se dividió en 6,401 
+observaciones para entrenamiento y 1,600 para prueba, manteniendo siempre 
+el muestreo estratificado para respetar el desbalance natural del dataset.
+
+Sobre el conjunto de entrenamiento se simularon tres escenarios 
+semi-supervisados: con el 5% de datos etiquetados se dispone de apenas 321 
+observaciones etiquetadas frente a 6,080 no etiquetadas, con el 10% se 
+tienen 641 etiquetadas y 5,760 no etiquetadas, y con el 20% se cuenta con 
+1,281 etiquetadas y 5,120 no etiquetadas. Es importante notar que incluso 
+en el escenario más favorable del 20%, la clase positiva cuenta con apenas 
+150 ejemplos etiquetados, lo que representa un reto significativo para 
+cualquier algoritmo de clasificación y justifica plenamente el uso de 
+técnicas semi-supervisadas que aprovechen la información contenida en los 
+datos no etiquetados.
