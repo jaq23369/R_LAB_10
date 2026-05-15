@@ -1,0 +1,216 @@
+---
+title: "Lab10_Semisupervisado"
+author: "Luis Gilberto González  Joel Antonio Jaquez   Fabian Morales"
+date: "2026-05-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r librerias}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(RSSL)
+library(ggplot2)
+library(gridExtra)
+library(scales)
+library(corrplot)
+library(knitr)
+```
+
+```{r carga-datos}
+df <- read.csv("Datos/bank-full.csv", sep = ";", stringsAsFactors = TRUE)
+```
+
+# Análisis Exploratorio de Datos
+```{r}
+cat("Dimensiones del dataset:", nrow(df), "filas x", ncol(df), "columnas\n")
+cat("Variables:\n")
+str(df)
+```
+El dataset Bank Marketing contiene información de 45,211 clientes contactados 
+durante campañas de marketing telefónico de un banco portugués entre 2008 y 2010. 
+Cada registro representa un contacto con un cliente al que se le ofreció un 
+depósito a plazo fijo, y la variable objetivo `y` indica si el cliente aceptó 
+o no la oferta. El dataset cuenta con 17 variables en total: 7 numéricas y 
+10 categóricas, sin valores faltantes, lo que simplifica el proceso de 
+preprocesamiento.
+
+## Estadística descriptiva
+```{r estadisticas-descriptivas}
+summary(df[, c("age", "balance", "duration", "campaign", "pdays", "previous")])
+```
+El análisis descriptivo de las variables numéricas revela características 
+importantes del dataset. La edad de los clientes oscila entre 18 y 95 años, 
+con una mediana de 39 años, lo que indica que la campaña se concentró 
+principalmente en adultos en edad laboral activa. El balance promedio anual 
+es de 1,362 euros, aunque la mediana es considerablemente menor (448 euros), 
+evidenciando una distribución fuertemente sesgada hacia la derecha con 
+valores extremos que llegan hasta los 102,127 euros, e incluso balances 
+negativos de hasta -8,019 euros correspondientes a clientes con cuentas 
+en descubierto. La duración de las llamadas presenta un mínimo de 0 segundos, 
+lo que representa contactos que no llegaron a concretarse y que serán 
+tratados en la etapa de preprocesamiento. El número de contactos por campaña 
+tiene una mediana de 2, pero alcanza un máximo de 63, lo que sugiere la 
+presencia de outliers significativos. Finalmente, la variable pdays, que 
+indica los días transcurridos desde el último contacto de una campaña 
+anterior, tiene su mediana en -1, confirmando que la gran mayoría de los 
+clientes no había sido contactado previamente, dato que también requerirá 
+una transformación antes del modelado.
+
+## Balance de clases
+```{r balance-clases, fig.height=4}
+df %>%
+  count(y) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = y, y = n, fill = y)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(round(pct, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+  labs(title = "Balance de clases de la variable objetivo",
+       x = "Suscribió depósito (y)", y = "Cantidad de clientes") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+El gráfico de balance de clases confirma una de las características más 
+importantes de este dataset y es que existe un desbalance marcado entre las dos 
+categorías de la variable objetivo. El 88.3% de los clientes contactados 
+no suscribió el depósito a plazo fijo, mientras que únicamente el 11.7% 
+respondió de forma positiva. Este desbalance es completamente esperable en 
+el contexto de campañas de marketing directo, donde las tasas de conversión 
+suelen ser bajas. Sin embargo, tiene implicaciones directas sobre cómo se 
+debe evaluar el desempeño de los modelos en el caso de un clasificador que simplemente 
+predijera "no" para todos los casos obtendría un 88.3% de exactitud sin 
+haber aprendido absolutamente nada. Por esta razón, a lo largo del laboratorio 
+se priorizarán métricas como el F1-score y el recall sobre la clase positiva, 
+las cuales son más informativas en escenarios con desbalance. Adicionalmente, 
+durante la separación de datos etiquetados y no etiquetados se utilizará 
+muestreo estratificado para garantizar que ambas clases estén representadas 
+proporcionalmente en el conjunto etiquetado, algo especialmente crítico cuando 
+se trabaja con fracciones tan pequeñas como el 5% o el 10% de los datos.
+
+## Distribucion numérica
+```{r distribucion-numericas, fig.height=6}
+vars_num <- c("age", "balance", "duration", "campaign", "previous")
+
+plots <- lapply(vars_num, function(var) {
+  ggplot(df, aes_string(x = var, fill = "y")) +
+    geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+    scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+    labs(title = var, x = var, y = "Frecuencia") +
+    theme_minimal() +
+    theme(legend.position = "bottom", 
+          plot.title = element_text(size = 10))
+})
+
+grid.arrange(grobs = plots, ncol = 2)
+```
+Las distribuciones de las variables numéricas revelan patrones relevantes 
+para el análisis. La edad presenta una distribución aproximadamente normal 
+con sesgo leve hacia la derecha, concentrándose la mayoría de clientes entre 
+los 25 y 50 años, con muy poca presencia de clientes mayores de 75 años. 
+El balance anual muestra una distribución extremadamente sesgada: casi todos 
+los clientes se agrupan cerca de cero, con una cola muy larga hacia la derecha 
+generada por unos pocos clientes con balances excepcionalmente altos, lo que 
+confirma la necesidad de aplicar normalización antes del modelado. La duración 
+de las llamadas también presenta un sesgo pronunciado hacia la derecha, donde 
+la mayoría de contactos dura menos de 500 segundos, pero visualmente se puede 
+observar que las llamadas más largas tienen una mayor proporción de respuestas 
+positivas, lo que la convierte en un predictor potencialmente muy informativo. 
+Tanto campaign como previous muestran distribuciones muy concentradas cerca 
+de cero con colas largas hacia la derecha, indicando que la mayoría de 
+clientes fue contactado pocas veces y que gran parte no tenía historial de 
+campañas previas. En todos los casos, la clase positiva (yes) aparece 
+visualmente minoritaria pero presente a lo largo de todo el rango de valores, 
+sin una separación limpia respecto a la clase negativa, lo que anticipa que 
+el problema de clasificación no será trivial.
+
+## Distribución categórica
+```{r distribucion-categoricas, fig.height=7}
+p1 <- ggplot(df, aes(x = job, fill = y)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Tasa de suscripción por ocupación", x = "", y = "Proporción") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- ggplot(df, aes(x = education, fill = y)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Tasa de suscripción por educación", x = "", y = "Proporción") +
+  theme_minimal()
+
+p3 <- ggplot(df, aes(x = marital, fill = y)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Tasa de suscripción por estado civil", x = "", y = "Proporción") +
+  theme_minimal()
+
+p4 <- ggplot(df, aes(x = poutcome, fill = y)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("no" = "#E74C3C", "yes" = "#2ECC71")) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Tasa de suscripción por resultado campaña anterior", 
+       x = "", y = "Proporción") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+El análisis de las variables categóricas permite identificar patrones 
+diferenciados en la tasa de suscripción según el perfil del cliente. En 
+cuanto a la ocupación, los estudiantes y jubilados destacan claramente como 
+los grupos con mayor proporción de respuestas positivas, superando el 25% 
+de conversión, mientras que los trabajadores de cuello azul, housemaids y 
+entrepreneurs presentan las tasas más bajas, cercanas al promedio general 
+del 11.7%. Respecto al nivel educativo, las diferencias entre grupos son 
+moderadas ya que los clientes con educación terciaria muestran una tasa de 
+suscripción ligeramente superior al resto, aunque ningún nivel educativo 
+presenta una separación drástica respecto a los demás. El estado civil 
+muestra poca variación entre categorías, siendo los clientes solteros 
+marginalmente más propensos a suscribirse en comparación con casados y 
+divorciados, lo que sugiere que esta variable por sí sola tiene un poder 
+predictivo limitado. La variable más informativa de las cuatro es sin duda 
+el resultado de la campaña anterior de que los clientes cuya campaña previa 
+resultó exitosa muestran una tasa de conversión cercana al 65%, 
+contrastando fuertemente con las categorías failure, other y unknown, que 
+se mantienen por debajo del 20%. Esto confirma que el historial de 
+interacción del cliente con el banco es uno de los predictores más 
+relevantes para este problema de clasificación.
+
+
+## Matríz de correlación
+```{r correlacion, fig.height=5}
+vars_cor <- df %>% 
+  select(age, balance, duration, campaign, pdays, previous) %>%
+  cor()
+
+corrplot(vars_cor, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.srt = 45,
+         title = "Matriz de correlación entre variables numéricas",
+         mar = c(0,0,1,0))
+```
+La matriz de correlación entre las variables numéricas confirma que las 
+relaciones lineales entre predictores son en su mayoría prácticamente 
+inexistentes. La gran mayoría de pares presenta correlaciones cercanas 
+a cero, lo que indica que cada variable aporta información relativamente 
+independiente y descarta problemas de multicolinealidad severa que 
+pudieran afectar el desempeño de los modelos. La única correlación 
+moderada visible es entre pdays y previous (r = 0.45), lo cual tiene 
+una explicación lógica directa: ambas variables describen el historial 
+de contactos anteriores del cliente, por lo que si un cliente fue 
+contactado previamente (previous > 0), necesariamente existe un valor 
+registrado de días transcurridos desde ese contacto (pdays ≠ -1). Vale 
+destacar también una correlación negativa leve entre duration y campaign 
+(r = -0.08), lo que podría sugerir que a mayor número de contactos 
+realizados, las llamadas individuales tienden a ser ligeramente más 
+cortas. En general, la baja correlación entre predictores es una 
+característica favorable para los modelos que se implementarán.
+
