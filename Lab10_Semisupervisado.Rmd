@@ -349,7 +349,7 @@ cualquier algoritmo de clasificación y justifica plenamente el uso de
 técnicas semi-supervisadas que aprovechen la información contenida en los 
 datos no etiquetados.
 
-#  Modelo Supervisado
+#  Modelo Supervisado - Randomforest
 
 ```{r}
 
@@ -446,5 +446,174 @@ exactitud se mantiene consistentemente por encima del 89% en los tres escenarios
 este valor es engañoso, un clasificador trivial que predijera para todas las observaciones 
 alcanzaría un accuracy del 88.3% sin haber aprendido nada, por lo que esta métrica no es 
 informativa en este contexto.
+
+# Self Training
+```{r}
+
+
+self_training_rf <- function(X_labeled, y_labeled, X_unlabeled,
+                              X_test, y_test,
+                              ntree     = 300,
+                              threshold = 0.80,
+                              max_iter  = 15) {
+  
+  X_l <- X_labeled
+  y_l <- y_labeled
+  X_u <- X_unlabeled
+  
+  historial <- data.frame(
+    iteracion        = integer(),
+    pseudo_etiquetas = integer(),
+    f1               = numeric(),
+    recall           = numeric(),
+    accuracy         = numeric()
+  )
+  
+  for (iter in seq_len(max_iter)) {
+    if (nrow(X_u) == 0) break
+    
+    set.seed(42 + iter)
+    modelo <- randomForest(x = X_l, y = y_l, ntree = ntree,
+                           mtry = floor(sqrt(ncol(X_l))))
+    
+    probs      <- predict(modelo, newdata = X_u, type = "prob")
+    confianza  <- apply(probs, 1, max)
+    idx_conf   <- which(confianza >= threshold)
+    
+    # Evaluar en test
+    preds_test <- predict(modelo, newdata = X_test)
+    cm_test    <- confusionMatrix(preds_test, y_test, positive = "yes")
+    
+    historial <- rbind(historial, data.frame(
+      iteracion        = iter,
+      pseudo_etiquetas = length(idx_conf),
+      f1               = ifelse(is.na(cm_test$byClass["F1"]), 0,
+                                cm_test$byClass["F1"]),
+      recall           = cm_test$byClass["Sensitivity"],
+      accuracy         = cm_test$overall["Accuracy"]
+    ))
+    
+    if (length(idx_conf) == 0) break
+    
+    # Agregar pseudo-etiquetas al conjunto etiquetado
+    pseudo_labels <- factor(colnames(probs)[apply(probs[idx_conf, ], 1, which.max)],
+                            levels = levels(y_l))
+    X_l <- rbind(X_l, X_u[idx_conf, ])
+    y_l <- c(y_l, pseudo_labels)
+    X_u <- X_u[-idx_conf, ]
+  }
+  
+  list(historial = historial, modelo_final = modelo,
+       X_labeled_final = X_l, n_pseudo = nrow(X_l) - nrow(X_labeled))
+}
+```
+
+```{r}
+
+resultados_st <- list()
+
+for (pct in names(splits)) {
+  sp <- splits[[pct]]
+  cat("\nEjecutando Self-Training |", pct, "etiquetado...\n")
+  
+  resultados_st[[pct]] <- self_training_rf(
+    X_labeled   = sp$X_labeled,
+    y_labeled   = sp$y_labeled,
+    X_unlabeled = sp$X_unlabeled,
+    X_test      = X_test,
+    y_test      = y_test,
+    ntree       = 300,
+    threshold   = 0.80,
+    max_iter    = 15
+  )
+  
+  hist <- resultados_st[[pct]]$historial
+  cat("  Iteraciones completadas:", nrow(hist), "\n")
+  cat("  Pseudo-etiquetas añadidas:", resultados_st[[pct]]$n_pseudo, "\n")
+  cat("  F1 final:", round(tail(hist$f1, 1), 4), "\n")
+  cat("  Recall final:", round(tail(hist$recall, 1), 4), "\n")
+}
+```
+```{r}
+
+
+df_evolucion <- do.call(rbind, lapply(names(resultados_st), function(pct) {
+  h <- resultados_st[[pct]]$historial
+  h$porcentaje <- pct
+  h
+}))
+
+ggplot(df_evolucion, aes(x = iteracion, y = f1, color = porcentaje, group = porcentaje)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("5%" = "#E74C3C", "10%" = "#F39C12", "20%" = "#2ECC71")) +
+  labs(
+    title   = "Evolución del F1-score por iteración - Self-Training RF",
+    x       = "Iteración",
+    y       = "F1-score (clase positiva)",
+    color   = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+```{r}
+
+for (pct in names(resultados_st)) {
+  modelo_final <- resultados_st[[pct]]$modelo_final
+  preds        <- predict(modelo_final, newdata = X_test)
+  cm           <- confusionMatrix(preds, y_test, positive = "yes")
+  
+  df_cm <- as.data.frame(cm$table)
+  colnames(df_cm) <- c("Predicho", "Real", "Freq")
+  
+  p <- ggplot(df_cm, aes(x = Real, y = Predicho, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#EBF5FB", high = "#1A5276") +
+    labs(
+      title    = paste0("Self-Training RF – ", pct, " etiquetado"),
+      subtitle = paste0("F1: ", round(cm$byClass["F1"], 3),
+                        "  |  Recall: ", round(cm$byClass["Sensitivity"], 3)),
+      x = "Valor Real", y = "Predicción"
+    ) +
+    theme_minimal(base_size = 11)
+  
+  print(p)
+}
+```
+
+# Tabla Comparativa Baseline vs self training.
+```{r}
+
+tabla_comp_st <- do.call(rbind, lapply(names(splits), function(pct) {
+  # Baseline
+  b <- resultados_baseline[[pct]]
+  # Self-Training
+  st_mod  <- resultados_st[[pct]]$modelo_final
+  st_pred <- predict(st_mod, newdata = X_test)
+  st_cm   <- confusionMatrix(st_pred, y_test, positive = "yes")
+  
+  data.frame(
+    Porcentaje  = pct,
+    Modelo      = c("Baseline RF", "Self-Training RF"),
+    Accuracy    = round(c(b$accuracy,  st_cm$overall["Accuracy"]), 4),
+    F1_score    = round(c(b$f1,        st_cm$byClass["F1"]), 4),
+    Recall      = round(c(b$recall,    st_cm$byClass["Sensitivity"]), 4),
+    Precision   = round(c(b$precision, st_cm$byClass["Pos Pred Value"]), 4)
+  )
+}))
+rownames(tabla_comp_st) <- NULL
+
+kable(tabla_comp_st,
+      caption = "Comparación Baseline vs Self-Training RF por porcentaje de etiquetado",
+      col.names = c("% Etiquetado", "Modelo", "Accuracy", "F1-Score", "Recall", "Precision"))
+```
+La comparación entre el baseline y el Self-Training RF revela un resultado contraintuitivo, pues en los 
+tres escenarios el Self-Training no supera al baseline en F1-score ni en recall, sino que los 
+reduce ligeramente, aunque sí incrementa la precisión en todos los casos. Esto sugiere que el umbral de 
+confianza de 0.80 está generando un algoritmo más selectivo pero no más sensible: el modelo 
+incorpora pseudo-etiquetas con alta certeza, pero dado el desbalance severo del dataset, la 
+mayoría de esas pseudo-etiquetas corresponden a la clase negativa, lo que refuerza el sesgo 
+hacia predecir "no" y penaliza el recall sobre la clase positiva que es precisamente la de interés.
 
 
