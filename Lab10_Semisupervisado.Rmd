@@ -348,3 +348,103 @@ en el escenario más favorable del 20%, la clase positiva cuenta con apenas
 cualquier algoritmo de clasificación y justifica plenamente el uso de 
 técnicas semi-supervisadas que aprovechen la información contenida en los 
 datos no etiquetados.
+
+#  Modelo Supervisado
+
+```{r}
+
+
+resultados_baseline <- list()
+
+for (pct in names(splits)) {
+  sp <- splits[[pct]]
+  
+
+  set.seed(42)
+  modelo_rf <- randomForest(
+    x          = sp$X_labeled,
+    y          = sp$y_labeled,
+    ntree      = 300,
+    mtry       = floor(sqrt(ncol(sp$X_labeled))),
+    importance = TRUE
+  )
+  
+  preds <- predict(modelo_rf, newdata = X_test)
+  cm    <- confusionMatrix(preds, y_test, positive = "yes")
+  
+  resultados_baseline[[pct]] <- list(
+    modelo    = modelo_rf,
+    cm        = cm,
+    accuracy  = cm$overall["Accuracy"],
+    f1        = cm$byClass["F1"],
+    recall    = cm$byClass["Sensitivity"],
+    precision = cm$byClass["Pos Pred Value"]
+  )
+  
+  cat("\n=== Baseline RF |", pct, "etiquetado ===\n")
+  cat("Accuracy :", round(cm$overall["Accuracy"], 4), "\n")
+  cat("F1-score :", round(cm$byClass["F1"], 4), "\n")
+  cat("Recall   :", round(cm$byClass["Sensitivity"], 4), "\n")
+}
+```
+# Matriz de confusion - MOdelo
+```{r}
+# ── Matrices de confusión – Baseline ──
+
+par(mfrow = c(1, 3))
+for (pct in names(resultados_baseline)) {
+  cm_tab <- resultados_baseline[[pct]]$cm$table
+  
+  df_cm <- as.data.frame(cm_tab)
+  colnames(df_cm) <- c("Predicho", "Real", "Freq")
+  
+  p <- ggplot(df_cm, aes(x = Real, y = Predicho, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#F8F9FA", high = "#2C3E50") +
+    labs(
+      title    = paste0("Baseline RF – ", pct, " etiquetado"),
+      subtitle = paste0("F1: ", round(resultados_baseline[[pct]]$f1, 3),
+                        "  |  Recall: ", round(resultados_baseline[[pct]]$recall, 3)),
+      x = "Valor Real", y = "Predicción"
+    ) +
+    theme_minimal(base_size = 11)
+  
+  print(p)
+}
+```
+Las tres matrices de confusión del baseline confirman un patrón consistente: el modelo clasifica 
+correctamente la gran mayoría de negativos pero falla sistemáticamente en detectar positivos. Con 
+5% de etiquetas identifica solo 37 de 187 casos positivos, con 10% sube a 47, y con 20% alcanza 
+57, evidenciando una mejora gradual pero insuficiente conforme aumentan las etiquetas disponibles. 
+En todos los escenarios el cuadrante de falsos negativos domina la clase positiva, lo que 
+refuerza que el baseline, entrenado únicamente con la fracción etiquetada, no logra capturar la 
+distribución real de la clase minoritaria y establece un piso de desempeño claro que los modelos 
+semi-supervisados deberán superar aprovechando la información estructural de los datos no etiquetados.
+
+# Resumen Modelo
+```{r}
+
+
+tabla_baseline <- data.frame(
+  Porcentaje_etiquetado = names(resultados_baseline),
+  Accuracy  = sapply(resultados_baseline, function(r) round(r$accuracy, 4)),
+  F1_score  = sapply(resultados_baseline, function(r) round(r$f1, 4)),
+  Recall    = sapply(resultados_baseline, function(r) round(r$recall, 4)),
+  Precision = sapply(resultados_baseline, function(r) round(r$precision, 4))
+)
+rownames(tabla_baseline) <- NULL
+
+kable(tabla_baseline,
+      caption = "Desempeño del modelo supervisado baseline",
+      col.names = c("% Etiquetado", "Accuracy", "F1-Score", "Recall", "Precision"))
+```
+
+Los resultados del modelo supervisado baseline evidencian con claridad el efecto del desbalance de 
+clases y la escasez de datos etiquetados sobre el desempeño real del clasificador. Si bien la 
+exactitud se mantiene consistentemente por encima del 89% en los tres escenarios, 
+este valor es engañoso, un clasificador trivial que predijera para todas las observaciones 
+alcanzaría un accuracy del 88.3% sin haber aprendido nada, por lo que esta métrica no es 
+informativa en este contexto.
+
+
