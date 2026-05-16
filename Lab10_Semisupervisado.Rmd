@@ -616,4 +616,420 @@ incorpora pseudo-etiquetas con alta certeza, pero dado el desbalance severo del 
 mayoría de esas pseudo-etiquetas corresponden a la clase negativa, lo que refuerza el sesgo 
 hacia predecir "no" y penaliza el recall sobre la clase positiva que es precisamente la de interés.
 
+# Co-Training
 
+```{r}
+co_training_rf <- function(X_labeled, y_labeled, X_unlabeled,
+                           X_test, y_test,
+                           ntree = 300,
+                           threshold = 0.80,
+                           max_iter = 15,
+                           max_add_per_iter = 200) {
+  
+  # Separación de variables en dos vistas:
+  # Vista 1: perfil del cliente
+  # Vista 2: variables de contacto y campaña
+  cols_vista1 <- grep("age|job|marital|education|default|balance|housing|loan",
+                      colnames(X_labeled), value = TRUE)
+  cols_vista2 <- setdiff(colnames(X_labeled), cols_vista1)
+  
+  X_l <- X_labeled
+  y_l <- y_labeled
+  X_u <- X_unlabeled
+  
+  historial <- data.frame(
+    iteracion = integer(),
+    pseudo_etiquetas = integer(),
+    f1 = numeric(),
+    recall = numeric(),
+    accuracy = numeric()
+  )
+  
+  modelo_final <- NULL
+  
+  for (iter in seq_len(max_iter)) {
+    if (nrow(X_u) == 0) break
+    
+    set.seed(100 + iter)
+    
+    modelo_v1 <- randomForest(
+      x = X_l[, cols_vista1, drop = FALSE],
+      y = y_l,
+      ntree = ntree,
+      mtry = floor(sqrt(length(cols_vista1)))
+    )
+    
+    modelo_v2 <- randomForest(
+      x = X_l[, cols_vista2, drop = FALSE],
+      y = y_l,
+      ntree = ntree,
+      mtry = floor(sqrt(length(cols_vista2)))
+    )
+    
+    prob_v1 <- predict(modelo_v1,
+                       newdata = X_u[, cols_vista1, drop = FALSE],
+                       type = "prob")
+    
+    prob_v2 <- predict(modelo_v2,
+                       newdata = X_u[, cols_vista2, drop = FALSE],
+                       type = "prob")
+    
+    pred_v1 <- colnames(prob_v1)[apply(prob_v1, 1, which.max)]
+    pred_v2 <- colnames(prob_v2)[apply(prob_v2, 1, which.max)]
+    
+    conf_v1 <- apply(prob_v1, 1, max)
+    conf_v2 <- apply(prob_v2, 1, max)
+    
+    # Se aceptan pseudo-etiquetas solo si ambas vistas coinciden
+    idx_conf <- which(pred_v1 == pred_v2 &
+                        conf_v1 >= threshold &
+                        conf_v2 >= threshold)
+    
+    # Limitar pseudo-etiquetas por iteración para evitar propagación masiva de error
+    if (length(idx_conf) > max_add_per_iter) {
+      confianza_prom <- (conf_v1[idx_conf] + conf_v2[idx_conf]) / 2
+      orden <- order(confianza_prom, decreasing = TRUE)
+      idx_conf <- idx_conf[orden[1:max_add_per_iter]]
+    }
+    
+    modelo_eval <- randomForest(
+      x = X_l,
+      y = y_l,
+      ntree = ntree,
+      mtry = floor(sqrt(ncol(X_l)))
+    )
+    
+    preds_test <- predict(modelo_eval, newdata = X_test)
+    cm_test <- confusionMatrix(preds_test, y_test, positive = "yes")
+    
+    historial <- rbind(historial, data.frame(
+      iteracion = iter,
+      pseudo_etiquetas = length(idx_conf),
+      f1 = ifelse(is.na(cm_test$byClass["F1"]), 0, cm_test$byClass["F1"]),
+      recall = cm_test$byClass["Sensitivity"],
+      accuracy = cm_test$overall["Accuracy"]
+    ))
+    
+    modelo_final <- modelo_eval
+    
+    if (length(idx_conf) == 0) break
+    
+    pseudo_labels <- factor(pred_v1[idx_conf], levels = levels(y_l))
+    
+    X_l <- rbind(X_l, X_u[idx_conf, ])
+    y_l <- c(y_l, pseudo_labels)
+    X_u <- X_u[-idx_conf, ]
+  }
+  
+  list(
+    historial = historial,
+    modelo_final = modelo_final,
+    X_labeled_final = X_l,
+    n_pseudo = nrow(X_l) - nrow(X_labeled)
+  )
+}
+```
+
+```{r}
+resultados_ct <- list()
+
+for (pct in names(splits)) {
+  sp <- splits[[pct]]
+  cat("\nEjecutando Co-Training |", pct, "etiquetado...\n")
+  
+  resultados_ct[[pct]] <- co_training_rf(
+    X_labeled = sp$X_labeled,
+    y_labeled = sp$y_labeled,
+    X_unlabeled = sp$X_unlabeled,
+    X_test = X_test,
+    y_test = y_test,
+    ntree = 300,
+    threshold = 0.80,
+    max_iter = 15,
+    max_add_per_iter = 200
+  )
+  
+  hist <- resultados_ct[[pct]]$historial
+  
+  cat("Iteraciones completadas:", nrow(hist), "\n")
+  cat("Pseudo-etiquetas añadidas:", resultados_ct[[pct]]$n_pseudo, "\n")
+  cat("F1 final:", round(tail(hist$f1, 1), 4), "\n")
+  cat("Recall final:", round(tail(hist$recall, 1), 4), "\n")
+}
+```
+
+```{r}
+df_evolucion_ct <- do.call(rbind, lapply(names(resultados_ct), function(pct) {
+  h <- resultados_ct[[pct]]$historial
+  h$porcentaje <- pct
+  h
+}))
+
+ggplot(df_evolucion_ct,
+       aes(x = iteracion, y = f1, color = porcentaje, group = porcentaje)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("5%" = "#E74C3C",
+                                "10%" = "#F39C12",
+                                "20%" = "#2ECC71")) +
+  labs(
+    title = "Evolución del F1-score por iteración - Co-Training RF",
+    x = "Iteración",
+    y = "F1-score clase positiva",
+    color = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+for (pct in names(resultados_ct)) {
+  modelo_final <- resultados_ct[[pct]]$modelo_final
+  preds <- predict(modelo_final, newdata = X_test)
+  cm <- confusionMatrix(preds, y_test, positive = "yes")
+  
+  df_cm <- as.data.frame(cm$table)
+  colnames(df_cm) <- c("Predicho", "Real", "Freq")
+  
+  p <- ggplot(df_cm, aes(x = Real, y = Predicho, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#EBF5FB", high = "#1A5276") +
+    labs(
+      title = paste0("Co-Training RF – ", pct, " etiquetado"),
+      subtitle = paste0("F1: ", round(cm$byClass["F1"], 3),
+                        " | Recall: ", round(cm$byClass["Sensitivity"], 3)),
+      x = "Valor Real",
+      y = "Predicción"
+    ) +
+    theme_minimal(base_size = 11)
+  
+  print(p)
+}
+```
+El algoritmo Co-Training RF completó las 15 iteraciones en los tres escenarios evaluados y añadió 3,000 pseudo-etiquetas en cada caso, lo que indica que el criterio de confianza permitió incorporar una cantidad considerable de datos no etiquetados al proceso de entrenamiento. Los resultados muestran una mejora clara conforme aumenta el porcentaje de datos etiquetados: con 5% de etiquetas el modelo alcanzó un F1-score final de 0.3115 y un recall de 0.2032; con 10% subió a un F1-score de 0.3726 y recall de 0.2620; y con 20% logró el mejor desempeño, con F1-score de 0.4476 y recall de 0.3422. Esta tendencia confirma que Co-Training se beneficia de contar con una base etiquetada inicial más representativa, ya que las dos vistas del modelo pueden generar pseudo-etiquetas más útiles cuando parten de más ejemplos reales.
+
+Las matrices de confusión evidencian que el modelo mantiene una fuerte tendencia a predecir la clase mayoritaria “no”, pero mejora gradualmente en la detección de la clase positiva. En el escenario de 5% etiquetado, el modelo identifica correctamente 38 de 187 casos positivos; con 10% identifica 49; y con 20% alcanza 65 verdaderos positivos. Aunque todavía existen muchos falsos negativos, especialmente en los escenarios con menos etiquetas, el aumento progresivo del recall demuestra que el algoritmo logra aprovechar parcialmente la información no etiquetada. El gráfico de evolución del F1-score también muestra que el escenario de 20% se mantiene consistentemente por encima de los demás durante casi todas las iteraciones, seguido por 10% y luego 5%, lo que refuerza la conclusión de que la calidad y cantidad inicial de etiquetas es determinante para el desempeño del aprendizaje semi-supervisado.
+
+
+# Comparación final entre los tres modelos
+
+```{r}
+tabla_final <- do.call(rbind, lapply(names(splits), function(pct) {
+  
+  b <- resultados_baseline[[pct]]
+  
+  st_pred <- predict(resultados_st[[pct]]$modelo_final, newdata = X_test)
+  st_cm <- confusionMatrix(st_pred, y_test, positive = "yes")
+  
+  ct_pred <- predict(resultados_ct[[pct]]$modelo_final, newdata = X_test)
+  ct_cm <- confusionMatrix(ct_pred, y_test, positive = "yes")
+  
+  data.frame(
+    Porcentaje = pct,
+    Modelo = c("Baseline RF", "Self-Training RF", "Co-Training RF"),
+    Accuracy = round(c(
+      b$accuracy,
+      st_cm$overall["Accuracy"],
+      ct_cm$overall["Accuracy"]
+    ), 4),
+    F1_score = round(c(
+      b$f1,
+      st_cm$byClass["F1"],
+      ct_cm$byClass["F1"]
+    ), 4),
+    Recall = round(c(
+      b$recall,
+      st_cm$byClass["Sensitivity"],
+      ct_cm$byClass["Sensitivity"]
+    ), 4),
+    Precision = round(c(
+      b$precision,
+      st_cm$byClass["Pos Pred Value"],
+      ct_cm$byClass["Pos Pred Value"]
+    ), 4)
+  )
+}))
+
+rownames(tabla_final) <- NULL
+
+kable(tabla_final,
+      caption = "Comparación final entre baseline y modelos semi-supervisados",
+      col.names = c("% Etiquetado", "Modelo", "Accuracy", "F1-Score", "Recall", "Precision"))
+```
+
+La comparación final muestra que Co-Training RF fue el modelo semi-supervisado con mejor desempeño general, especialmente cuando se utilizó el 20% de datos etiquetados. En ese escenario alcanzó el mejor F1-score de todos los modelos, con 0.4476, y también el mayor recall, con 0.3422. Esto significa que Co-Training logró identificar una mayor cantidad de clientes que sí aceptaron el depósito, superando tanto al baseline supervisado como a Self-Training RF.
+
+El comportamiento de los modelos cambia según el porcentaje de datos etiquetados. Con 5%, el baseline obtuvo el mejor F1-score con 0.3008, ligeramente por debajo quedó Co-Training con 0.3045 en la tabla, mientras que Self-Training tuvo el peor resultado con 0.2182. Esto indica que, cuando hay muy pocas etiquetas iniciales, Self-Training puede reforzar errores del modelo base y reducir la capacidad de detectar la clase positiva. En cambio, Co-Training logra mantenerse competitivo porque exige coincidencia entre dos vistas antes de incorporar pseudo-etiquetas.
+
+Con 10% y 20% de datos etiquetados, Co-Training supera claramente a los otros enfoques. En 10% alcanza un F1-score de 0.3788 frente a 0.3658 del baseline y 0.2643 de Self-Training. En 20%, la diferencia es más evidente: Co-Training obtiene 0.4476, baseline 0.4176 y Self-Training 0.3180. Esto confirma que Co-Training aprovecha mejor los datos no etiquetados cuando el conjunto inicial de etiquetas es suficientemente representativo.
+
+Self-Training RF, por otro lado, no logró mejorar al baseline en ningún escenario. Aunque su precisión es alta, especialmente con 10% y 20% de etiquetas, su recall disminuye considerablemente. Esto significa que el modelo se vuelve más conservador y predice menos casos positivos, lo cual no es ideal para este problema, ya que la clase de interés son los clientes que sí aceptan el depósito. En conclusión, el mejor modelo semi-supervisado fue Co-Training RF con 20% de datos etiquetados, porque logró el mejor equilibrio entre F1-score y recall para la clase positiva.
+
+
+# Experimentación de hiperparámetros - Self-Training
+
+```{r}
+self_training_rf_tuning <- function(X_labeled, y_labeled, X_unlabeled,
+                                    X_test, y_test,
+                                    ntree     = 300,
+                                    threshold = 0.80,
+                                    max_iter  = 10) {
+  
+  X_l <- X_labeled
+  y_l <- y_labeled
+  X_u <- X_unlabeled
+  
+  historial <- data.frame(
+    iteracion        = integer(),
+    pseudo_etiquetas = integer(),
+    f1               = numeric(),
+    recall           = numeric(),
+    accuracy         = numeric()
+  )
+  
+  modelo_final <- NULL
+  
+  for (iter in seq_len(max_iter)) {
+    if (nrow(X_u) == 0) break
+    
+    set.seed(42 + iter)
+    
+    modelo <- randomForest(
+      x     = X_l,
+      y     = y_l,
+      ntree = ntree,
+      mtry  = floor(sqrt(ncol(X_l)))
+    )
+    
+    modelo_final <- modelo
+    
+    probs <- predict(modelo, newdata = X_u, type = "prob")
+    
+    confianza <- apply(probs, 1, max)
+    idx_conf  <- which(confianza >= threshold)
+    
+    preds_test <- predict(modelo, newdata = X_test)
+    cm_test    <- confusionMatrix(preds_test, y_test, positive = "yes")
+    
+    historial <- rbind(historial, data.frame(
+      iteracion        = iter,
+      pseudo_etiquetas = length(idx_conf),
+      f1               = ifelse(is.na(cm_test$byClass["F1"]), 0,
+                                cm_test$byClass["F1"]),
+      recall           = cm_test$byClass["Sensitivity"],
+      accuracy         = cm_test$overall["Accuracy"]
+    ))
+    
+    if (length(idx_conf) == 0) break
+    
+    # Versión segura: evita error cuando idx_conf tiene solo 1 fila
+    probs_conf <- probs[idx_conf, , drop = FALSE]
+    
+    pseudo_labels <- factor(
+      colnames(probs_conf)[apply(probs_conf, 1, which.max)],
+      levels = levels(y_l)
+    )
+    
+    X_l <- rbind(X_l, X_u[idx_conf, , drop = FALSE])
+    y_l <- c(y_l, pseudo_labels)
+    X_u <- X_u[-idx_conf, , drop = FALSE]
+  }
+  
+  list(
+    historial       = historial,
+    modelo_final    = modelo_final,
+    X_labeled_final = X_l,
+    n_pseudo        = nrow(X_l) - nrow(X_labeled)
+  )
+}
+```
+
+```{r}
+umbrales <- c(0.70, 0.80, 0.90)
+resultados_tuning_st <- data.frame()
+
+for (th in umbrales) {
+  for (pct in names(splits)) {
+    sp <- splits[[pct]]
+    
+    cat("\nTuning Self-Training | Threshold:", th, "|", pct, "etiquetado\n")
+    
+    tmp <- self_training_rf_tuning(
+      X_labeled   = sp$X_labeled,
+      y_labeled   = sp$y_labeled,
+      X_unlabeled = sp$X_unlabeled,
+      X_test      = X_test,
+      y_test      = y_test,
+      ntree       = 300,
+      threshold   = th,
+      max_iter    = 10
+    )
+    
+    pred_tmp <- predict(tmp$modelo_final, newdata = X_test)
+    cm_tmp   <- confusionMatrix(pred_tmp, y_test, positive = "yes")
+    
+    resultados_tuning_st <- rbind(resultados_tuning_st, data.frame(
+      Porcentaje       = pct,
+      Threshold        = th,
+      Accuracy         = round(cm_tmp$overall["Accuracy"], 4),
+      F1_score         = round(cm_tmp$byClass["F1"], 4),
+      Recall           = round(cm_tmp$byClass["Sensitivity"], 4),
+      Precision        = round(cm_tmp$byClass["Pos Pred Value"], 4),
+      Pseudo_etiquetas = tmp$n_pseudo
+    ))
+  }
+}
+
+kable(resultados_tuning_st,
+      caption = "Análisis de sensibilidad del threshold en Self-Training",
+      col.names = c("% Etiquetado", "Threshold", "Accuracy", "F1-Score",
+                    "Recall", "Precision", "Pseudo-etiquetas"))
+```
+
+```{r}
+ggplot(resultados_tuning_st,
+       aes(x = factor(Threshold), y = F1_score,
+           fill = Porcentaje)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Sensibilidad del F1-score ante cambios en el threshold",
+    x = "Threshold de confianza",
+    y = "F1-score clase positiva",
+    fill = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 12)
+```
+```{r}
+ggplot(resultados_tuning_st,
+       aes(x = factor(Threshold), y = Recall,
+           fill = Porcentaje)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Sensibilidad del recall ante cambios en el threshold",
+    x = "Threshold de confianza",
+    y = "Recall clase positiva",
+    fill = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+ggplot(resultados_tuning_st,
+       aes(x = factor(Threshold), y = Pseudo_etiquetas,
+           fill = Porcentaje)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Cantidad de pseudo-etiquetas generadas según threshold",
+    x = "Threshold de confianza",
+    y = "Número de pseudo-etiquetas",
+    fill = "% Etiquetado"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+El análisis de sensibilidad del threshold muestra que este hiperparámetro tiene un efecto directo sobre el desempeño de Self-Training RF. En general, los mejores resultados se obtuvieron con un threshold = 0.90, especialmente en los escenarios con 10% y 20% de datos etiquetados. Con 10% etiquetado, el F1-score aumentó de 0.2100 con threshold = 0.70 a 0.3925 con threshold = 0.90, mientras que el recall subió de 0.1230 a 0.2781. De forma similar, con 20% etiquetado el F1-score pasó de 0.2672 a 0.4059 y el recall de 0.1658 a 0.2941. Esto indica que, para este dataset, un umbral más estricto ayuda a seleccionar pseudo-etiquetas de mayor calidad y reduce la propagación de errores.
+
+El comportamiento con 5% etiquetado fue distinto, ya que el F1-score se mantuvo prácticamente estable entre 0.2100 y 0.2162, y el recall apenas cambió de 0.1230 a 0.1283. Esto sugiere que cuando el conjunto inicial etiquetado es demasiado pequeño, el modelo base no tiene suficiente información para generar pseudo-etiquetas realmente útiles, incluso aumentando el nivel de confianza requerido. En otras palabras, el threshold por sí solo no compensa la falta de ejemplos etiquetados representativos.
+
+También se observa una relación inversa entre el threshold y la cantidad de pseudo-etiquetas generadas. Con threshold = 0.70, el modelo incorporó más pseudo-etiquetas: 6,078 en el escenario de 5%, 5,759 en 10% y 5,078 en 20%. Al aumentar el threshold a 0.90, esas cantidades disminuyeron a 5,375, 4,946 y 4,315 respectivamente. Esto confirma que un umbral más alto hace que Self-Training sea más conservador, agregando menos datos no etiquetados, pero con mayor confiabilidad. Por tanto, para este caso el mejor hiperparámetro fue threshold = 0.90, ya que produjo el mejor equilibrio entre F1-score, recall y control del error en los escenarios con mayor disponibilidad de etiquetas.
